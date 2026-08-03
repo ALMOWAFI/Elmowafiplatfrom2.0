@@ -12,15 +12,17 @@ Services
 """
 
 import json
+import time
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 
-from elmowafi_msgs.msg import GameEvent, GameState, Violation
+from elmowafi_msgs.msg import EyeStateArray, GameEvent, GameState, Violation
 from elmowafi_msgs.srv import SubmitAction
 
 from game_master.engine import MafiaEngine, Phase, Role, RuleError
+from game_master.referee import peek_violations
 
 
 class GameMasterNode(Node):
@@ -33,6 +35,9 @@ class GameMasterNode(Node):
         self.event_pub = self.create_publisher(GameEvent, '/game/events', 10)
         self.create_subscription(Violation, '/cv/violations',
                                  self.on_violation, 10)
+        self.create_subscription(EyeStateArray, '/cv/eye_states',
+                                 self.on_eye_states, 10)
+        self._last_callout: dict[str, float] = {}
         self.create_service(SubmitAction, '/game/submit_action',
                             self.on_action)
 
@@ -88,7 +93,24 @@ class GameMasterNode(Node):
                                    'phase': msg.phase,
                                    'confidence': round(msg.confidence, 3)})
         self.event_pub.publish(ev)
-        self.get_logger().warn(f'PEEK: {msg.player_id} during {msg.phase}')
+        self.get_logger().warning(f'PEEK: {msg.player_id} during {msg.phase}')
+
+    def on_eye_states(self, msg: EyeStateArray):
+        """Role-blind eye states from cv_referee -> phase-aware callouts."""
+        if self.engine is None:
+            return
+        states = [(s.player_id, s.eyes_open, s.confidence)
+                  for s in msg.states]
+        for pid in peek_violations(self.engine, states,
+                                   self._last_callout, time.time()):
+            ev = GameEvent()
+            ev.stamp = self.get_clock().now().to_msg()
+            ev.type = 'peek_callout'
+            ev.data_json = json.dumps({'player': pid,
+                                       'phase': self.engine.phase.value})
+            self.event_pub.publish(ev)
+            self.get_logger().warning(
+                f'PEEK: {pid} during {self.engine.phase.value}')
 
     # ---------- player actions ----------
 

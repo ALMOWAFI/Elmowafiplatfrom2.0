@@ -131,7 +131,8 @@ class MafiaEngine:
         mafia = [p.id for p in self.players.values() if p.role is Role.MAFIA]
         self._emit("roles_assigned",
                    roles={p.id: p.role.value for p in self.players.values()},
-                   mafia_ids=mafia)
+                   mafia_ids=mafia,
+                   names={p.id: p.name for p in self.players.values()})
         self._begin_night()
 
     # ---------- night ----------
