@@ -6,19 +6,30 @@ line up, then speaks it. Every spoken line is also published on
 /narrator/utterances so screens can subtitle it.
 
 TTS engines:
-  piper   (default) neural voices via the `piper` CLI + aplay.
-          ar_JO-kareem-medium for Arabic, en_US-lessac-medium for
-          English by default (paths are parameters, swap for better
-          voices freely — e.g. an Egyptian-dialect voice if one shows
-          up in rhasspy/piper-voices later).
-  espeak  formant synthesis fallback (always available via apt,
-          noticeably more robotic — kept for environments without
-          piper installed or as a sanity-check baseline).
-  none    no audio, /narrator/utterances still published. (Deliberately
-          not called "off" — that's a reserved YAML 1.1 boolean literal,
-          so `tts:=off` on a `ros2 launch` command line silently becomes
-          the boolean False instead of the string "off" and crashes the
-          node with a type error. "none" isn't a YAML keyword.)
+  piper       (default) neural voices via the `piper` CLI + paplay/aplay.
+              ar_JO-kareem-medium for Arabic, en_US-lessac-medium for
+              English by default (paths are parameters, swap for better
+              voices freely — e.g. an Egyptian-dialect voice if one shows
+              up in rhasspy/piper-voices later).
+  elevenlabs  cloud TTS, noticeably better voice quality, needs internet
+              and an API key (env var ELEVENLABS_API_KEY — deliberately
+              NOT a ROS parameter, so it never shows up in `ros2 param
+              list` or launch logs). Falls back to piper automatically
+              on any failure: no key set, no internet, quota exceeded,
+              timeout, bad response. Free-tier ElevenLabs accounts get
+              10,000 characters/month — plenty for actual game nights
+              (a full game is roughly 500-3000 characters) but don't
+              leave this on as the default for casual dev/test loops;
+              use piper or none for that and switch to elevenlabs for
+              the real thing.
+  espeak      formant synthesis fallback (always available via apt,
+              noticeably more robotic — kept for environments without
+              piper installed or as a sanity-check baseline).
+  none        no audio, /narrator/utterances still published. (Deliberately
+              not called "off" — that's a reserved YAML 1.1 boolean literal,
+              so `tts:=off` on a `ros2 launch` command line silently becomes
+              the boolean False instead of the string "off" and crashes the
+              node with a type error. "none" isn't a YAML keyword.)
 
 Parameters
   language        'ar' | 'en'          (default 'ar')
@@ -30,19 +41,36 @@ Parameters
                                         node warms the model at startup so
                                         real gameplay should see the warm
                                         number, not the cold one)
-  tts             'piper' | 'espeak' | 'none'   (default 'piper')
-  piper_bin       str                  path to the piper executable
+  tts                   'piper' | 'elevenlabs' | 'espeak' | 'none'   (default 'piper')
+  piper_bin             str            path to the piper executable
   ar_voice_model / en_voice_model      str, path to a piper .onnx voice
-  player_bin      str                  'paplay' (PulseAudio, needed under WSLg)
+  player_bin            str            'paplay' (PulseAudio, needed under WSLg)
                                         or 'aplay' (plain ALSA) — default 'paplay'
+  elevenlabs_voice_id   str            default 'JBFqnCBsd6RMkjVDRZzb'
+                                        ("George — Warm, Captivating
+                                        Storyteller"; fits a dramatic
+                                        game host. All voices on a fresh
+                                        account are English-labeled, but
+                                        the multilingual model speaks
+                                        Arabic through any of them.)
+  elevenlabs_model_id   str            default 'eleven_multilingual_v2'
+  elevenlabs_timeout_s  double         default 15.0
+  mpg123_bin            str            default 'mpg123' (decodes the
+                                        MP3 ElevenLabs returns; piped
+                                        into player_bin rather than
+                                        trusting mpg123's own audio
+                                        backend, which was unreliable
+                                        under WSLg during testing)
 """
 
 import json
+import os
 import queue
 import re
 import shutil
 import subprocess
 import threading
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -85,6 +113,10 @@ class NarratorNode(Node):
         self.declare_parameter('en_voice_model',
                                str(DEFAULT_MODELS / 'en_US-lessac-medium.onnx'))
         self.declare_parameter('player_bin', 'paplay')
+        self.declare_parameter('elevenlabs_voice_id', 'JBFqnCBsd6RMkjVDRZzb')
+        self.declare_parameter('elevenlabs_model_id', 'eleven_multilingual_v2')
+        self.declare_parameter('elevenlabs_timeout_s', 15.0)
+        self.declare_parameter('mpg123_bin', 'mpg123')
 
         self.names: dict[str, str] = {}
         self.utter_pub = self.create_publisher(String, '/narrator/utterances', 10)
@@ -172,6 +204,8 @@ class NarratorNode(Node):
             mode = str(self.get_parameter('tts').value)
             if mode == 'piper':
                 self._speak_piper(line)
+            elif mode == 'elevenlabs':
+                self._speak_elevenlabs(line)
             elif mode == 'espeak':
                 self._speak_espeak(line)
             # mode == 'none' (or anything else): utterance already
@@ -239,6 +273,80 @@ class NarratorNode(Node):
                    '--format=s16le', '--channels=1']
         return [player_bin, '-r', str(rate), '-f', 'S16_LE', '-t', 'raw',
                '-q', '-']
+
+    def _speak_elevenlabs(self, line: str):
+        api_key = os.environ.get('ELEVENLABS_API_KEY', '')
+        if not api_key:
+            self.get_logger().warning(
+                'ELEVENLABS_API_KEY not set; falling back to piper',
+                throttle_duration_sec=60)
+            self._speak_piper(line)
+            return
+
+        voice_id = str(self.get_parameter('elevenlabs_voice_id').value)
+        model_id = str(self.get_parameter('elevenlabs_model_id').value)
+        timeout = float(self.get_parameter('elevenlabs_timeout_s').value)
+        url = f'https://api.elevenlabs.io/v1/text-to-speech/{voice_id}'
+        body = json.dumps({'text': line, 'model_id': model_id}).encode('utf-8')
+        req = urllib.request.Request(
+            url, body,
+            {'xi-api-key': api_key, 'Content-Type': 'application/json',
+             'Accept': 'audio/mpeg'})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                mp3_bytes = r.read()
+        except urllib.error.HTTPError as e:
+            detail = e.read()[:200] if hasattr(e, 'read') else b''
+            self.get_logger().warning(
+                f'elevenlabs http {e.code}: {detail!r}; falling back to piper',
+                throttle_duration_sec=30)
+            self._speak_piper(line)
+            return
+        except Exception as e:  # noqa: BLE001 — any failure -> piper
+            self.get_logger().warning(
+                f'elevenlabs request failed ({e}); falling back to piper',
+                throttle_duration_sec=30)
+            self._speak_piper(line)
+            return
+
+        if not self._play_mp3(mp3_bytes):
+            self._speak_piper(line)
+
+    def _play_mp3(self, mp3_bytes: bytes) -> bool:
+        """Decode via mpg123 and play via player_bin, rather than trust
+        mpg123's own audio backend (unreliable under WSLg in testing:
+        it tried jack/ALSA and produced dozens of error lines even
+        though it happened to still exit 0). Returns False on any
+        failure so the caller can fall back."""
+        mpg123_bin = str(self.get_parameter('mpg123_bin').value)
+        player_bin = str(self.get_parameter('player_bin').value)
+        if shutil.which(mpg123_bin) is None:
+            self.get_logger().warning(f'mpg123 not found: {mpg123_bin}',
+                                      throttle_duration_sec=30)
+            return False
+        if shutil.which(player_bin) is None:
+            self.get_logger().warning(f'audio player not found: {player_bin}',
+                                      throttle_duration_sec=30)
+            return False
+        try:
+            decoded = subprocess.run(
+                [mpg123_bin, '-q', '-s', '-'],
+                input=mp3_bytes, capture_output=True, timeout=30)
+            if decoded.returncode != 0 or not decoded.stdout:
+                self.get_logger().warning(
+                    f'mpg123 decode failed: {decoded.stderr[:200]!r}',
+                    throttle_duration_sec=30)
+                return False
+            # ElevenLabs MP3 output observed at 44.1kHz mono (confirmed
+            # via `file` on a real response, 2026-08-03); mpg123 decodes
+            # at the source rate by default.
+            subprocess.run(self._player_args(player_bin, 44100),
+                           input=decoded.stdout, timeout=30)
+            return True
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warning(f'mp3 playback failed: {e}',
+                                      throttle_duration_sec=30)
+            return False
 
     def _speak_espeak(self, line: str):
         if shutil.which('espeak-ng') is None:
