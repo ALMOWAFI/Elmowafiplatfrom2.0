@@ -34,6 +34,15 @@ Parameters
   closed_threshold  double blink score above this = closed (default 0.5)
   smooth_frames     int    majority window, both signals (default 5)
   enable_hands      bool   run pose/hand-raise detection (default True)
+  camera_retry_s    double seconds between camera-open retries while no
+                           camera is available (default 5.0) — without
+                           this, a missing camera makes cv2.VideoCapture()
+                           get hammered at the ~20Hz tick rate, which is
+                           both wasteful and spams OpenCV's own stderr
+                           diagnostics (those bypass rclpy's log
+                           throttling entirely since they're printed by
+                           OpenCV's C++ layer, not through this node's
+                           logger)
 """
 
 import time
@@ -71,6 +80,7 @@ class CvRefereeNode(Node):
         self.declare_parameter('closed_threshold', 0.5)
         self.declare_parameter('smooth_frames', 5)
         self.declare_parameter('enable_hands', True)
+        self.declare_parameter('camera_retry_s', 5.0)
 
         self.eye_pub = self.create_publisher(EyeStateArray, '/cv/eye_states', 10)
         self.hand_pub = self.create_publisher(HandRaiseArray, '/cv/hand_raises', 10)
@@ -80,12 +90,18 @@ class CvRefereeNode(Node):
         self._cap = None
         self._face_landmarker = None
         self._pose_landmarker = None
+        self._last_camera_attempt = 0.0
+        self._models_ready = False  # models can load even if camera can't open yet
         self.timer = self.create_timer(0.05, self.tick)  # ~20 Hz target
         self.get_logger().info('cv_referee starting')
 
     # ---------- lazy pipeline setup ----------
 
-    def _ensure_pipeline(self) -> bool:
+    def _load_models(self) -> bool:
+        """Import mediapipe/cv2 and construct the landmarkers. Cheap to
+        call repeatedly once it has succeeded once (early-returns), so
+        it isn't gated behind the camera-retry backoff — no reason to
+        delay noticing a fixed missing-model-file once it's fixed."""
         if self._face_landmarker is not None:
             return True
         face_model = Path(str(self.get_parameter('model_path').value)).expanduser()
@@ -102,26 +118,13 @@ class CvRefereeNode(Node):
                 throttle_duration_sec=30)
             return False
         try:
-            import cv2  # noqa: F401
+            import cv2
             import mediapipe as mp
             from mediapipe.tasks import python as mp_python
             from mediapipe.tasks.python import vision
         except ImportError as e:
             self.get_logger().error(f'missing dependency: {e}',
                                     throttle_duration_sec=30)
-            return False
-
-        video_path = str(self.get_parameter('video_path').value)
-        import cv2
-        if video_path:
-            self._cap = cv2.VideoCapture(video_path)
-        else:
-            self._cap = cv2.VideoCapture(
-                int(self.get_parameter('camera_index').value))
-        if not self._cap.isOpened():
-            self.get_logger().error('cannot open camera/video',
-                                    throttle_duration_sec=30)
-            self._cap = None
             return False
 
         face_options = vision.FaceLandmarkerOptions(
@@ -141,7 +144,36 @@ class CvRefereeNode(Node):
         self._mp = mp
         self._cv2 = cv2
         self.get_logger().info(
-            f'camera + model(s) ready (hands={"on" if enable_hands else "off"})')
+            f'model(s) loaded (hands={"on" if enable_hands else "off"})')
+        return True
+
+    def _ensure_pipeline(self) -> bool:
+        if self._cap is not None:
+            return True
+
+        retry_s = float(self.get_parameter('camera_retry_s').value)
+        now = time.time()
+        if now - self._last_camera_attempt < retry_s:
+            return False  # backing off: don't hammer cv2.VideoCapture()
+        self._last_camera_attempt = now
+
+        if not self._load_models():
+            return False
+
+        video_path = str(self.get_parameter('video_path').value)
+        cv2 = self._cv2
+        if video_path:
+            cap = cv2.VideoCapture(video_path)
+        else:
+            cap = cv2.VideoCapture(int(self.get_parameter('camera_index').value))
+        if not cap.isOpened():
+            self.get_logger().error(
+                f'cannot open camera/video, retrying every {retry_s:.0f}s',
+                throttle_duration_sec=30)
+            return False
+
+        self._cap = cap
+        self.get_logger().info('camera ready')
         return True
 
     # ---------- main loop ----------

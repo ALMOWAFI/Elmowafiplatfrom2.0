@@ -14,7 +14,11 @@ TTS engines:
   espeak  formant synthesis fallback (always available via apt,
           noticeably more robotic — kept for environments without
           piper installed or as a sanity-check baseline).
-  off     no audio, /narrator/utterances still published.
+  none    no audio, /narrator/utterances still published. (Deliberately
+          not called "off" — that's a reserved YAML 1.1 boolean literal,
+          so `tts:=off` on a `ros2 launch` command line silently becomes
+          the boolean False instead of the string "off" and crashes the
+          node with a type error. "none" isn't a YAML keyword.)
 
 Parameters
   language        'ar' | 'en'          (default 'ar')
@@ -26,7 +30,7 @@ Parameters
                                         node warms the model at startup so
                                         real gameplay should see the warm
                                         number, not the cold one)
-  tts             'piper' | 'espeak' | 'off'   (default 'piper')
+  tts             'piper' | 'espeak' | 'none'   (default 'piper')
   piper_bin       str                  path to the piper executable
   ar_voice_model / en_voice_model      str, path to a piper .onnx voice
   player_bin      str                  'paplay' (PulseAudio, needed under WSLg)
@@ -170,7 +174,8 @@ class NarratorNode(Node):
                 self._speak_piper(line)
             elif mode == 'espeak':
                 self._speak_espeak(line)
-            # mode == 'off': utterance already published, nothing to do
+            # mode == 'none' (or anything else): utterance already
+            # published on /narrator/utterances, nothing more to do
 
     def _voice_model(self, lang: str) -> Path:
         key = 'ar_voice_model' if lang == 'ar' else 'en_voice_model'

@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>elmowafi_bringup</name>
+  <version>0.1.0</version>
+  <description>Launch files to start the full mafia-game stack together</description>
+  <maintainer email="aelmowafi@constructor.university">Ali Elmowafi</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>game_master</exec_depend>
+  <exec_depend>web_bridge</exec_depend>
+  <exec_depend>narrator</exec_depend>
+  <exec_depend>cv_referee</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
