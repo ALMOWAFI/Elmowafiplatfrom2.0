@@ -46,6 +46,7 @@ class Bridge:
         self.loop: asyncio.AbstractEventLoop | None = None
         self.sockets: dict[str, WebSocket] = {}
         self.names: dict[str, str] = {}
+        self.host: str = ''
         self.roles: dict[str, str] = {}
         self.mafia_ids: list[str] = []
         self.last_state: dict = {'phase': 'lobby', 'round': 0,
@@ -63,8 +64,11 @@ class Bridge:
         self.last_state = {'phase': msg.phase, 'round': msg.round,
                            'alive_ids': list(msg.alive_ids),
                            'winner': msg.winner}
-        self._submit(self.broadcast({'type': 'state', **self.last_state,
-                                     'names': self.names}))
+        self._submit(self.broadcast(self.state_payload()))
+
+    def state_payload(self) -> dict:
+        return {'type': 'state', **self.last_state,
+                'names': self.names, 'host': self.host}
 
     def on_ros_event(self, msg: GameEvent):
         data = json.loads(msg.data_json) if msg.data_json else {}
@@ -147,21 +151,24 @@ class Bridge:
                                             body.get('target_id', ''),
                                             body.get('data'))
             if atype == 'join' and result.get('accepted'):
-                self.names[pid] = (body.get('data') or {}).get('name', pid)
-                await self.broadcast({'type': 'state', **self.last_state,
-                                      'names': self.names})
+                if not (result.get('result') or {}).get('rejoined'):
+                    self.names[pid] = (body.get('data') or {}).get('name', pid)
+                if not self.host or self.host not in self.names:
+                    self.host = pid
+                await self.broadcast(self.state_payload())
             if atype == 'reset' and result.get('accepted'):
                 self.roles = {}
                 self.mafia_ids = []
                 self.names = {}
+                self.host = ''
+                await self.broadcast(self.state_payload())
             return JSONResponse(result)
 
         @app.websocket('/ws/{player_id}')
         async def ws_endpoint(ws: WebSocket, player_id: str):
             await ws.accept()
             self.sockets[player_id] = ws
-            await ws.send_json({'type': 'state', **self.last_state,
-                                'names': self.names})
+            await ws.send_json(self.state_payload())
             if player_id in self.roles:
                 payload = {'type': 'role', 'role': self.roles[player_id]}
                 if player_id in self.mafia_ids:

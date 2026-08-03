@@ -91,6 +91,7 @@
 const T = {
   ar: { joinTitle:'انضم للعبة', namePh:'اسمك', joinBtn:'دخول',
     lobbyTitle:'في انتظار اللاعبين…', startBtn:'ابدأ اللعبة',
+    needMore:n=>`محتاجين ${n} كمان للبدء`,
     mafiaN:n=>`عدد المافيا: ${n}`,
     roles:{ mafia:['🔪','مافيا','أنت من المافيا! لا تكشف نفسك. شركاؤك:'],
             doctor:['🩺','الدكتور','كل ليلة تحمي شخصًا واحدًا'],
@@ -116,6 +117,7 @@ const T = {
     dead:'☠️ خرجت من اللعبة — تابع بصمت', youWin:'فزت! 🎉', youLose:'خسرت 😢' },
   en: { joinTitle:'Join the game', namePh:'Your name', joinBtn:'Join',
     lobbyTitle:'Waiting for players…', startBtn:'Start game',
+    needMore:n=>`Need ${n} more to start`,
     mafiaN:n=>`Mafia count: ${n}`,
     roles:{ mafia:['🔪','Mafia','You are mafia! Stay hidden. Partners:'],
             doctor:['🩺','Doctor','Each night, protect one person'],
@@ -142,11 +144,15 @@ const T = {
 };
 
 let lang = 'ar';
-let pid = localStorage.getItem('pid') ||
+// sessionStorage: identity is per-tab (so several tabs = several players),
+// but survives a refresh of the same tab
+let pid = sessionStorage.getItem('pid') ||
           ('p_' + Math.random().toString(36).slice(2, 8));
-localStorage.setItem('pid', pid);
-let state = { phase:'lobby', alive_ids:[], names:{}, winner:'' };
-let myRole = null, partners = [], selected = null, isHost = false, joined = false;
+sessionStorage.setItem('pid', pid);
+let state = { phase:'lobby', alive_ids:[], names:{}, winner:'', host:'' };
+let myRole = null, partners = [], selected = null;
+const isHost = () => state.host === pid;
+const joined = () => pid in state.names;
 
 const $ = id => document.getElementById(id);
 const t = () => T[lang];
@@ -214,12 +220,8 @@ function showBanner(text, ms) {
 async function join() {
   const n = $('nameInput').value.trim();
   if (!n) return;
-  const out = await api('join', '', { name: n });
-  if (out.accepted) {
-    joined = true;
-    isHost = out.result && out.result.players === 1;
-    render();
-  }
+  await api('join', '', { name: n });
+  // joined/host state arrives via the state broadcast
 }
 
 async function startGame() {
@@ -257,31 +259,41 @@ function targetButtons(candidates, actionLabel, action) {
 
 function render() {
   const inLobby = state.phase === 'lobby';
-  $('join').classList.toggle('hidden', joined || !inLobby);
-  $('lobby').classList.toggle('hidden', !(joined && inLobby));
+  $('join').classList.toggle('hidden', joined() || !inLobby);
+  $('lobby').classList.toggle('hidden', !(joined() && inLobby));
   $('game').classList.toggle('hidden', inLobby);
   $('roleCard').classList.toggle('hidden', inLobby || !myRole);
 
-  if (joined && inLobby) {
+  if (joined() && inLobby) {
     const list = $('lobbyList');
     list.innerHTML = '';
     Object.entries(state.names).forEach(([p, n]) => {
       const d = document.createElement('div');
       d.className = 'pbtn';
-      d.textContent = (p === pid ? '⭐ ' : '') + n;
+      d.textContent = (p === state.host ? '⭐ ' : '') + n + (p === pid ? ` (${lang==='ar'?'أنت':'you'})` : '');
       list.appendChild(d);
     });
     const count = Object.keys(state.names).length;
-    $('hostBox').classList.toggle('hidden', !(isHost && count >= 4));
-    if (isHost && count >= 4) {
+    $('hostBox').classList.toggle('hidden', !isHost());
+    if (isHost()) {
       const sel = $('mafiaCount');
-      const maxM = Math.max(1, count - 3);
-      sel.innerHTML = '';
-      for (let i = 1; i <= maxM; i++) {
-        const o = document.createElement('option');
-        o.value = i; o.textContent = t().mafiaN(i);
-        if (i === Math.max(1, Math.floor(count / 4))) o.selected = true;
-        sel.appendChild(o);
+      const startBtn = $('hostBox').querySelector('button');
+      if (count >= 4) {
+        sel.classList.remove('hidden');
+        startBtn.disabled = false;
+        startBtn.textContent = t().startBtn;
+        const maxM = Math.max(1, count - 3);
+        sel.innerHTML = '';
+        for (let i = 1; i <= maxM; i++) {
+          const o = document.createElement('option');
+          o.value = i; o.textContent = t().mafiaN(i);
+          if (i === Math.max(1, Math.floor(count / 4))) o.selected = true;
+          sel.appendChild(o);
+        }
+      } else {
+        sel.classList.add('hidden');
+        startBtn.disabled = true;
+        startBtn.textContent = t().needMore(4 - count);
       }
     }
     return;

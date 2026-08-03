@@ -112,10 +112,15 @@ class GameMasterNode(Node):
 
     def _act_join(self, req):
         if self.engine is not None:
+            # reconnect of a known player is fine; new players can't join mid-game
+            if req.player_id in self.engine.players:
+                return {'joined': req.player_id, 'rejoined': True,
+                        'players': len(self.engine.players)}
             raise RuleError('game already running')
         name = json.loads(req.data_json or '{}').get('name', req.player_id)
         if any(pid == req.player_id for pid, _ in self.lobby):
-            raise RuleError('already joined')
+            return {'joined': req.player_id, 'rejoined': True,
+                    'players': len(self.lobby)}
         self.lobby.append((req.player_id, name))
         return {'joined': req.player_id, 'players': len(self.lobby)}
 
