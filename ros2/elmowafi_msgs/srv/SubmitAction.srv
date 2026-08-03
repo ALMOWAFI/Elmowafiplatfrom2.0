@@ -1,0 +1,11 @@
+# Player action routed from the web bridge (phones) to game_master.
+# action_type: create | join | start | kill | protect | ask |
+#              begin_vote | vote | skip
+string player_id
+string action_type
+string target_id      # empty when not applicable
+string data_json      # extra payload (e.g. player name on join, mafia_count on start)
+---
+bool accepted
+string message        # human-readable rejection reason if not accepted
+string result_json    # e.g. detective answer, assigned role
