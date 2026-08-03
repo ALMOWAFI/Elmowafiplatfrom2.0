@@ -6,6 +6,19 @@ delivered only to their recipient, everything else is broadcast.
 
 Run:  ros2 run web_bridge web_bridge_node
 Phones connect to  http://<server>:8080/
+
+Own-camera eye monitoring (added after a real user tried the game and
+expected a camera permission prompt on the page itself — a room-camera
++ separate relay script was the wrong mental model): each phone can
+opt in to watching ITS OWN holder via getUserMedia() in the browser,
+periodically POSTing a JPEG frame to /api/cv/eye_frame?player_id=...
+This runs face detection SERVER-SIDE (mediapipe can process an
+uploaded image fine even though WSL2 can't open a live camera device —
+that limitation is specific to cv2.VideoCapture(), not image
+processing) and republishes on the same /cv/eye_states topic
+game_master already consumes, so it's indistinguishable downstream
+from the room-camera path (cv_referee / win_cam_relay.py) — both can
+run at once if useful.
 """
 
 import asyncio
@@ -14,11 +27,13 @@ import os
 import threading
 from pathlib import Path
 
+import numpy as np
+
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, DurabilityPolicy, HistoryPolicy
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 import uvicorn
 
@@ -26,12 +41,20 @@ from elmowafi_msgs.msg import (EyeState, EyeStateArray, GameEvent, GameState,
                                HandRaise, HandRaiseArray)
 from elmowafi_msgs.srv import SubmitAction
 
+from cv_referee.vision import BoolSmoother
+
 STATIC_DIR = Path(__file__).resolve().parent / 'static'
 # Built React app (vite build output). If present it is served as the UI,
 # with SPA fallback; the plain static page stays available at /simple.
 DIST_DIR = Path(os.environ.get(
     'ELMOWAFI_WEB_DIST',
     Path.home() / 'elmowafi_ws/src/elmowafiplatform/web/dist'))
+
+EYE_CLOSED_THRESHOLD = 0.5  # matches cv_referee's default closed_threshold
+EYE_SMOOTH_FRAMES = 3       # shorter than cv_referee's 5: own-camera frames
+                            # arrive slower (~2/s) than a live 20Hz feed,
+                            # so a smaller window still debounces without
+                            # feeling laggy
 
 
 class BridgeNode(Node):
@@ -64,6 +87,81 @@ class Bridge:
                                  'alive_ids': [], 'winner': ''}
         self.node = BridgeNode(self.on_ros_event, self.on_ros_state)
         self.app = self.make_app()
+
+        self._face_landmarker = None  # lazy-loaded on first uploaded frame
+        self._cv2 = None
+        self._mp = None
+        self._frame_smoothers: dict[str, BoolSmoother] = {}
+
+    # ---------- own-camera eye monitoring (browser -> here) ----------
+
+    def _ensure_frame_pipeline(self) -> bool:
+        if self._face_landmarker is not None:
+            return True
+        model = Path.home() / 'models/face_landmarker.task'
+        if not model.exists():
+            self.node.get_logger().error(
+                f'face model not found: {model}', throttle_duration_sec=30)
+            return False
+        try:
+            import cv2
+            import mediapipe as mp
+            from mediapipe.tasks import python as mp_python
+            from mediapipe.tasks.python import vision
+        except ImportError as e:
+            self.node.get_logger().error(f'missing dependency: {e}',
+                                         throttle_duration_sec=30)
+            return False
+        options = vision.FaceLandmarkerOptions(
+            base_options=mp_python.BaseOptions(model_asset_path=str(model)),
+            running_mode=vision.RunningMode.IMAGE,  # independent frames from
+            num_faces=1,                            # possibly-many phones,
+            output_face_blendshapes=True)           # not one ordered stream
+        self._face_landmarker = vision.FaceLandmarker.create_from_options(options)
+        self._cv2 = cv2
+        self._mp = mp
+        self.node.get_logger().info('own-camera face model loaded')
+        return True
+
+    def process_eye_frame(self, player_id: str, jpeg_bytes: bytes) -> dict | None:
+        """Decode+detect a single uploaded frame. Returns None on any
+        failure (missing model/deps, bad image, no face found) so the
+        caller can report that plainly rather than guess."""
+        if not self._ensure_frame_pipeline():
+            return None
+        cv2, mp = self._cv2, self._mp
+        arr = cv2.imdecode(np.frombuffer(jpeg_bytes, dtype=np.uint8),
+                          cv2.IMREAD_COLOR)
+        if arr is None:
+            return None
+        rgb = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        res = self._face_landmarker.detect(mp_img)
+        if not res.face_landmarks:
+            return {'found_face': False}
+
+        scores = {c.category_name: c.score for c in res.face_blendshapes[0]}
+        blink = (scores.get('eyeBlinkLeft', 0.0)
+                 + scores.get('eyeBlinkRight', 0.0)) / 2
+        closed_now = blink > EYE_CLOSED_THRESHOLD
+        smoother = self._frame_smoothers.setdefault(
+            player_id, BoolSmoother(n=EYE_SMOOTH_FRAMES))
+        closed = smoother.update(0, closed_now)
+        confidence = min(1.0, abs(blink - EYE_CLOSED_THRESHOLD) * 2 + 0.5)
+        return {'found_face': True, 'eyes_open': not closed,
+               'confidence': confidence}
+
+    def publish_own_camera_eye_state(self, player_id: str, eyes_open: bool,
+                                     confidence: float):
+        msg = EyeStateArray()
+        msg.stamp = self.node.get_clock().now().to_msg()
+        st = EyeState()
+        st.player_id = player_id
+        st.face_index = 0
+        st.eyes_open = eyes_open
+        st.confidence = float(confidence)
+        msg.states.append(st)
+        self.node.eye_pub.publish(msg)
 
     # ---------- ROS -> phones ----------
 
@@ -194,6 +292,27 @@ class Bridge:
                 msg.states.append(st)
             self.node.eye_pub.publish(msg)
             return {'ok': True, 'n': len(msg.states)}
+
+        @app.post('/api/cv/eye_frame')
+        async def cv_eye_frame(request: Request, player_id: str):
+            jpeg_bytes = await request.body()
+            if not jpeg_bytes:
+                return JSONResponse({'ok': False, 'error': 'empty frame'},
+                                    status_code=400)
+            # mediapipe decode+detect is CPU-bound; run off the event loop
+            # so it doesn't stall other players' requests/WebSockets
+            result = await asyncio.to_thread(
+                self.process_eye_frame, player_id, jpeg_bytes)
+            if result is None:
+                return JSONResponse(
+                    {'ok': False, 'error': 'detector unavailable (see server log)'},
+                    status_code=503)
+            if not result['found_face']:
+                return {'ok': True, 'found_face': False}
+            self.publish_own_camera_eye_state(
+                player_id, result['eyes_open'], result['confidence'])
+            return {'ok': True, 'found_face': True,
+                   'eyes_open': result['eyes_open']}
 
         @app.post('/api/cv/hand_raises')
         async def cv_hand_raises(body: dict):

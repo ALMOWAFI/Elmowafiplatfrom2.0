@@ -32,6 +32,10 @@ const L = {
     lobby: 'Waiting for players…', you: 'you', start: 'Start game',
     needMore: (n: number) => `Need ${n} more to start`, mafiaN: (n: number) => `Mafia: ${n}`,
     dead: '☠️ You are out — watch quietly', win: 'You win! 🎉', lose: 'You lose 😢',
+    camOff: '📷 Turn on camera watch', camRequesting: 'Requesting camera…',
+    camOn: '👁 Watching — eyes open', camOnClosed: '👁 Watching — eyes closed',
+    camDenied: '🚫 Camera permission denied', camError: '⚠️ Camera error',
+    camHint: 'Point your phone at your own face during the night phase',
     roles: {
       mafia: ['🔪', 'Mafia', 'Stay hidden. Partners:'],
       doctor: ['🩺', 'Doctor', 'Each night, protect one person'],
@@ -53,6 +57,10 @@ const L = {
     lobby: 'في انتظار اللاعبين…', you: 'أنت', start: 'ابدأ اللعبة',
     needMore: (n: number) => `محتاجين ${n} كمان للبدء`, mafiaN: (n: number) => `المافيا: ${n}`,
     dead: '☠️ خرجت من اللعبة — تابع بصمت', win: 'فزت! 🎉', lose: 'خسرت 😢',
+    camOff: '📷 شغّل مراقبة الكاميرا', camRequesting: 'طلب إذن الكاميرا…',
+    camOn: '👁 بتراقب — عينك مفتوحة', camOnClosed: '👁 بتراقب — عينك مقفولة',
+    camDenied: '🚫 تم رفض إذن الكاميرا', camError: '⚠️ خطأ في الكاميرا',
+    camHint: 'وجّه موبايلك على وشك خلال الليل',
     roles: {
       mafia: ['🔪', 'مافيا', 'لا تكشف نفسك. شركاؤك:'],
       doctor: ['🩺', 'الدكتور', 'كل ليلة تحمي شخصًا واحدًا'],
@@ -121,6 +129,18 @@ const MafiaGamePage: React.FC = () => {
   const [banner, setBanner] = useState('');
   const bannerTimer = useRef<ReturnType<typeof setTimeout>>();
 
+  // own-camera eye monitoring: this phone watches its own holder and
+  // posts frames to the server, which runs real face detection and
+  // republishes on the same /cv/eye_states topic the room-camera path
+  // uses — see web_bridge/node.py process_eye_frame().
+  type CamStatus = 'off' | 'requesting' | 'on' | 'denied' | 'error';
+  const [camStatus, setCamStatus] = useState<CamStatus>('off');
+  const [eyesOpen, setEyesOpen] = useState<boolean | null>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const captureTimerRef = useRef<ReturnType<typeof setInterval>>();
+
   const pname = useCallback(
     (p: string) => state.names[p] ?? p, [state.names]);
 
@@ -175,6 +195,59 @@ const MafiaGamePage: React.FC = () => {
     if (!out.accepted && out.message) showBanner('⚠️ ' + out.message, 2500);
     return out;
   }, [pid, showBanner]);
+
+  const stopCamera = useCallback(() => {
+    clearInterval(captureTimerRef.current);
+    streamRef.current?.getTracks().forEach((tr) => tr.stop());
+    streamRef.current = null;
+    setCamStatus('off');
+    setEyesOpen(null);
+  }, []);
+
+  const captureFrame = useCallback(async () => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas || video.readyState < 2) return;
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    ctx.drawImage(video, 0, 0);
+    canvas.toBlob(async (blob) => {
+      if (!blob) return;
+      try {
+        const r = await fetch(`/api/cv/eye_frame?player_id=${pid}`, {
+          method: 'POST', headers: { 'Content-Type': 'image/jpeg' },
+          body: blob,
+        });
+        const out = await r.json();
+        if (out.ok && out.found_face) setEyesOpen(out.eyes_open);
+      } catch {
+        // transient network hiccup — next frame will retry, no need to
+        // flip camStatus to 'error' for a single dropped upload
+      }
+    }, 'image/jpeg', 0.7);
+  }, [pid]);
+
+  const startCamera = useCallback(async () => {
+    setCamStatus('requesting');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'user' }, audio: false,
+      });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+      setCamStatus('on');
+      captureTimerRef.current = setInterval(captureFrame, 700);
+    } catch (e) {
+      setCamStatus((e as DOMException)?.name === 'NotAllowedError' ? 'denied' : 'error');
+    }
+  }, [captureFrame]);
+
+  useEffect(() => () => stopCamera(), [stopCamera]);
 
   const joined = pid in state.names;
   const isHost = state.host === pid;
@@ -332,6 +405,43 @@ const MafiaGamePage: React.FC = () => {
                 <div className="text-sm text-muted-foreground text-center mt-1">{phase[1]}</div>
               )}
               {phaseBody}
+            </CardContent>
+          </Card>
+        )}
+
+        {!inLobby && amAlive && (
+          <Card>
+            <CardContent className="py-4 flex items-center gap-3">
+              <video ref={videoRef} muted playsInline
+                className={`rounded-lg w-16 h-16 object-cover bg-black ${camStatus === 'on' ? '' : 'hidden'}`} />
+              <canvas ref={canvasRef} className="hidden" />
+              <div className="flex-1">
+                {camStatus === 'off' && (
+                  <Button variant="outline" size="sm" onClick={startCamera}>
+                    {t.camOff}
+                  </Button>
+                )}
+                {camStatus === 'requesting' && (
+                  <span className="text-sm text-muted-foreground">{t.camRequesting}</span>
+                )}
+                {camStatus === 'on' && (
+                  <div>
+                    <span className="text-sm font-medium">
+                      {eyesOpen === false ? t.camOnClosed : t.camOn}
+                    </span>
+                    <div className="text-xs text-muted-foreground">{t.camHint}</div>
+                  </div>
+                )}
+                {camStatus === 'denied' && (
+                  <span className="text-sm text-destructive">{t.camDenied}</span>
+                )}
+                {camStatus === 'error' && (
+                  <span className="text-sm text-destructive">{t.camError}</span>
+                )}
+              </div>
+              {camStatus === 'on' && (
+                <Button variant="ghost" size="sm" onClick={stopCamera}>✕</Button>
+              )}
             </CardContent>
           </Card>
         )}
