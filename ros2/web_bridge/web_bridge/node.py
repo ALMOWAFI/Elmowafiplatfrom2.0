@@ -22,7 +22,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 import uvicorn
 
-from elmowafi_msgs.msg import GameEvent, GameState
+from elmowafi_msgs.msg import EyeState, EyeStateArray, GameEvent, GameState
 from elmowafi_msgs.srv import SubmitAction
 
 STATIC_DIR = Path(__file__).resolve().parent / 'static'
@@ -44,6 +44,9 @@ class BridgeNode(Node):
         self.create_subscription(GameEvent, '/game/events', on_event, 50)
         self.create_subscription(GameState, '/game/state', on_state, latched)
         self.action_client = self.create_client(SubmitAction, '/game/submit_action')
+        # dev relay: a camera process outside ROS (e.g. Windows webcam)
+        # can POST eye states which we republish for game_master
+        self.eye_pub = self.create_publisher(EyeStateArray, '/cv/eye_states', 10)
 
 
 class Bridge:
@@ -175,6 +178,20 @@ class Bridge:
                 self.host = ''
                 await self.broadcast(self.state_payload())
             return JSONResponse(result)
+
+        @app.post('/api/cv/eye_states')
+        async def cv_eye_states(body: dict):
+            msg = EyeStateArray()
+            msg.stamp = self.node.get_clock().now().to_msg()
+            for s in body.get('states', []):
+                st = EyeState()
+                st.player_id = str(s.get('player_id', ''))
+                st.face_index = int(s.get('face_index', 0))
+                st.eyes_open = bool(s.get('eyes_open', False))
+                st.confidence = float(s.get('confidence', 0.0))
+                msg.states.append(st)
+            self.node.eye_pub.publish(msg)
+            return {'ok': True, 'n': len(msg.states)}
 
         @app.websocket('/ws/{player_id}')
         async def ws_endpoint(ws: WebSocket, player_id: str):
