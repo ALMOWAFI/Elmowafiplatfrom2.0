@@ -3,11 +3,15 @@
 Family platform: family tree, memories, travel planning — and an AI game
 master that referees family games (Mafia first) with on-device AI.
 
-Runs self-hosted on a home server. All AI inference is local: no cloud
-calls at game time.
+Runs self-hosted on a home server. AI inference defaults to local: no
+cloud calls at game time out of the box. The narrator's voice can
+optionally use ElevenLabs (cloud TTS, needs internet + an API key)
+for better quality than the offline voice — opt-in, not the default,
+and it falls back to the offline voice automatically if unavailable.
 
 **Status (2026-08-03):** the mafia game is fully playable from phones,
-end to end, with a talking bilingual referee (Piper neural TTS) and a
+end to end, with a talking bilingual referee (Piper neural TTS by
+default, optional ElevenLabs cloud TTS for better quality) and a
 camera that catches players peeking during the night phase — all
 verified live against a real webcam and real gameplay, not just unit
 tests. What's *not* yet proven: multi-person accuracy (only tested with
@@ -29,7 +33,7 @@ phones ←→ web_bridge ←──────────────→ game_m
        can't see a USB camera directly (true for WSL2)                    
                                           ↓
                               narrator ←─ /game/events
-                     (Piper neural TTS, ar/en, optional local-LLM flavor)
+              (Piper TTS default / optional ElevenLabs, ar/en, optional LLM flavor)
 ```
 
 | Directory | What it is |
@@ -37,7 +41,7 @@ phones ←→ web_bridge ←──────────────→ game_m
 | `ros2/elmowafi_msgs` | Message/service definitions shared by all nodes |
 | `ros2/game_master` | Mafia rules engine (pure Python, unit-tested) + phase/role-aware peek judging + ROS node |
 | `ros2/cv_referee` | Camera → eye state (MediaPipe FaceLandmarker) + hand-raise (PoseLandmarker), role-blind |
-| `ros2/narrator` | Bilingual narration (Piper TTS default, espeak-ng fallback, optional local-LLM flavor) |
+| `ros2/narrator` | Bilingual narration (Piper TTS default, optional ElevenLabs cloud TTS, espeak-ng fallback, optional local-LLM flavor) |
 | `ros2/web_bridge` | FastAPI/WebSocket bridge: serves the phone UI, routes actions to game_master, relays camera POSTs |
 | `ros2/elmowafi_bringup` | `ros2 launch` file to start everything together |
 | `web/` | React/TS frontend — the mafia game lives at `/game`, alongside the rest of the family platform |
@@ -59,6 +63,24 @@ ros2 launch elmowafi_bringup game_night.launch.py language:=en with_camera:=fals
 ```
 
 Open `http://<this-machine>:8080/game` from a phone on the same network.
+
+### Narrator voice: Piper (default) or ElevenLabs (better, needs internet)
+
+```bash
+ros2 launch elmowafi_bringup game_night.launch.py            # Piper (offline)
+ros2 launch elmowafi_bringup game_night.launch.py tts:=elevenlabs
+```
+
+ElevenLabs needs `ELEVENLABS_API_KEY` set in the environment before
+launch (NOT a ROS parameter — deliberately kept out of `ros2 param
+list` and launch logs; store it outside the repo, e.g. in
+`~/.elevenlabs_env` sourced from `.bashrc`, chmod 600). Falls back to
+Piper automatically on any failure — no key, no internet, expired key,
+quota exceeded, timeout. Free-tier ElevenLabs accounts get 10,000
+characters/month; a full game is roughly 500-3000 characters, so real
+game nights are comfortably covered, but leaving `tts:=elevenlabs` on
+for casual dev/test loops will burn through it — use the default
+(Piper) or `tts:=none` for that instead.
 
 ### If your ROS host can't see a USB camera (true for WSL2)
 
