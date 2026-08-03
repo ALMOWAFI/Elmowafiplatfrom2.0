@@ -22,7 +22,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 import uvicorn
 
-from elmowafi_msgs.msg import EyeState, EyeStateArray, GameEvent, GameState
+from elmowafi_msgs.msg import (EyeState, EyeStateArray, GameEvent, GameState,
+                               HandRaise, HandRaiseArray)
 from elmowafi_msgs.srv import SubmitAction
 
 STATIC_DIR = Path(__file__).resolve().parent / 'static'
@@ -45,8 +46,9 @@ class BridgeNode(Node):
         self.create_subscription(GameState, '/game/state', on_state, latched)
         self.action_client = self.create_client(SubmitAction, '/game/submit_action')
         # dev relay: a camera process outside ROS (e.g. Windows webcam)
-        # can POST eye states which we republish for game_master
+        # can POST eye/hand states which we republish for the ROS graph
         self.eye_pub = self.create_publisher(EyeStateArray, '/cv/eye_states', 10)
+        self.hand_pub = self.create_publisher(HandRaiseArray, '/cv/hand_raises', 10)
 
 
 class Bridge:
@@ -191,6 +193,20 @@ class Bridge:
                 st.confidence = float(s.get('confidence', 0.0))
                 msg.states.append(st)
             self.node.eye_pub.publish(msg)
+            return {'ok': True, 'n': len(msg.states)}
+
+        @app.post('/api/cv/hand_raises')
+        async def cv_hand_raises(body: dict):
+            msg = HandRaiseArray()
+            msg.stamp = self.node.get_clock().now().to_msg()
+            for s in body.get('states', []):
+                st = HandRaise()
+                st.player_id = str(s.get('player_id', ''))
+                st.pose_index = int(s.get('pose_index', 0))
+                st.hand_raised = bool(s.get('hand_raised', False))
+                st.confidence = float(s.get('confidence', 0.0))
+                msg.states.append(st)
+            self.node.hand_pub.publish(msg)
             return {'ok': True, 'n': len(msg.states)}
 
         @app.websocket('/ws/{player_id}')

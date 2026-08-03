@@ -10,6 +10,8 @@ rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/GameEvent.msg"
   "msg/EyeState.msg"
   "msg/EyeStateArray.msg"
+  "msg/HandRaise.msg"
+  "msg/HandRaiseArray.msg"
   "msg/Violation.msg"
   "srv/SubmitAction.srv"
   DEPENDENCIES builtin_interfaces
