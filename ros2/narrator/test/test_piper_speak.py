@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import rclpy
 
-from narrator.node import NarratorNode
+from narrator.node import NarratorNode, _looks_broken
 
 
 @pytest.fixture
@@ -149,3 +149,46 @@ def test_player_args_aplay_flags():
     args = NarratorNode._player_args('/usr/bin/aplay', 16000)
     assert args == ['/usr/bin/aplay', '-r', '16000', '-f', 'S16_LE',
                     '-t', 'raw', '-q', '-']
+
+
+# --- real failure modes observed from a live qwen2.5:3b run 2026-08-03 ---
+
+def test_looks_broken_detects_replacement_char():
+    assert _looks_broken('�ا غادرت، كانت عصابة يا حميم!')
+
+
+def test_looks_broken_detects_glued_scripts():
+    assert _looks_broken('اليوم الثاني، الجميع ينامون، ثمmafia يستيقظون بشدة.')
+    assert _looks_broken('mafiaوصلت')  # glued the other direction too
+
+
+def test_looks_broken_allows_spaced_names_in_arabic():
+    assert not _looks_broken('يا Ali! عينك مفتوحة!')
+    assert not _looks_broken('قررت العائلة إعدام Marwa. كان مافيا!')
+
+
+def test_looks_broken_allows_clean_text():
+    assert not _looks_broken('صباح الخير يا عائلة.')
+    assert not _looks_broken('Good morning, family.')
+
+
+def test_flavor_falls_back_when_output_looks_broken(node):
+    n, tmp_path = node
+    with patch.object(n, '_ollama_generate',
+                      return_value='ثمmafia يستيقظون'):
+        result = n._flavor('Night falls.', 'ar')
+    assert result == 'Night falls.'  # template, not the broken LLM output
+
+
+def test_flavor_uses_llm_output_when_clean(node):
+    n, tmp_path = node
+    with patch.object(n, '_ollama_generate', return_value='الليل يهبط.'):
+        result = n._flavor('Night falls.', 'ar')
+    assert result == 'الليل يهبط.'
+
+
+def test_flavor_falls_back_on_timeout(node):
+    n, tmp_path = node
+    with patch.object(n, '_ollama_generate', side_effect=TimeoutError('slow')):
+        result = n._flavor('Night falls.', 'ar')
+    assert result == 'Night falls.'

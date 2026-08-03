@@ -17,19 +17,25 @@ TTS engines:
   off     no audio, /narrator/utterances still published.
 
 Parameters
-  language      'ar' | 'en'          (default 'ar')
-  use_llm       bool                 rewrite lines via local Ollama (default False)
-  ollama_url    str                  default http://127.0.0.1:11434
-  ollama_model  str                  default 'qwen2.5:3b'
-  tts           'piper' | 'espeak' | 'off'   (default 'piper')
-  piper_bin     str                  path to the piper executable
-  ar_voice_model / en_voice_model    str, path to a piper .onnx voice
-  player_bin    str                  'paplay' (PulseAudio, needed under WSLg)
-                                      or 'aplay' (plain ALSA) — default 'paplay'
+  language        'ar' | 'en'          (default 'ar')
+  use_llm         bool                 rewrite lines via local Ollama (default False)
+  ollama_url      str                  default http://127.0.0.1:11434
+  ollama_model    str                  default 'qwen2.5:3b'
+  ollama_timeout_s double              default 12.0 (measured warm ~3.3s,
+                                        cold-load ~13.6s on this dev box;
+                                        node warms the model at startup so
+                                        real gameplay should see the warm
+                                        number, not the cold one)
+  tts             'piper' | 'espeak' | 'off'   (default 'piper')
+  piper_bin       str                  path to the piper executable
+  ar_voice_model / en_voice_model      str, path to a piper .onnx voice
+  player_bin      str                  'paplay' (PulseAudio, needed under WSLg)
+                                        or 'aplay' (plain ALSA) — default 'paplay'
 """
 
 import json
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -46,6 +52,18 @@ from narrator.phrases import render
 
 DEFAULT_MODELS = Path.home() / 'models/piper'
 
+# Observed failure modes from a real qwen2.5:3b run (2026-08-03): a stray
+# U+FFFD replacement char, and Arabic/Latin scripts glued together with no
+# space ("thenmafia" written as one token). Names embedded in a template
+# on purpose ("hey Ali!") are fine because they're space-separated; only
+# the glued-with-no-space case indicates a broken generation.
+_MOJIBAKE_RE = re.compile('�')
+_GLUED_SCRIPT_RE = re.compile(r'[؀-ۿ][A-Za-z]|[A-Za-z][؀-ۿ]')
+
+
+def _looks_broken(text: str) -> bool:
+    return bool(_MOJIBAKE_RE.search(text) or _GLUED_SCRIPT_RE.search(text))
+
 
 class NarratorNode(Node):
     def __init__(self):
@@ -54,6 +72,7 @@ class NarratorNode(Node):
         self.declare_parameter('use_llm', False)
         self.declare_parameter('ollama_url', 'http://127.0.0.1:11434')
         self.declare_parameter('ollama_model', 'qwen2.5:3b')
+        self.declare_parameter('ollama_timeout_s', 12.0)
         self.declare_parameter('tts', 'piper')
         self.declare_parameter('piper_bin',
                                str(Path.home() / '.local/bin/piper'))
@@ -70,6 +89,10 @@ class NarratorNode(Node):
         self._piper_rates: dict[str, int] = {}
         self._speech_q: queue.Queue[str] = queue.Queue()
         threading.Thread(target=self._speaker_loop, daemon=True).start()
+
+        if bool(self.get_parameter('use_llm').value):
+            threading.Thread(target=self._warm_up_llm, daemon=True).start()
+
         self.get_logger().info(
             f"narrator ready (tts={self.get_parameter('tts').value})")
 
@@ -94,28 +117,48 @@ class NarratorNode(Node):
 
     # ---------- optional LLM flavor ----------
 
-    def _flavor(self, line: str, lang: str) -> str:
+    def _warm_up_llm(self):
+        """Load the model into Ollama's memory at startup (~13s cold on
+        this dev box) so the first real narration line doesn't eat that
+        cost mid-game."""
+        try:
+            self._ollama_generate('hi', timeout=30.0)
+            self.get_logger().info('LLM flavor model warmed up')
+        except Exception as e:  # noqa: BLE001
+            self.get_logger().warning(f'LLM warm-up failed: {e}')
+
+    def _ollama_generate(self, prompt: str, timeout: float) -> str:
         url = str(self.get_parameter('ollama_url').value)
         model = str(self.get_parameter('ollama_model').value)
-        lang_name = 'Egyptian Arabic' if lang == 'ar' else 'English'
-        prompt = (f'You are a dramatic mafia-game narrator. Rewrite this line '
-                  f'in {lang_name}, keep it under 25 words, keep all names '
-                  f'exactly as written, no explanations:\n{line}')
         body = json.dumps({'model': model, 'prompt': prompt,
                            'stream': False,
-                           'options': {'temperature': 0.9,
+                           'options': {'temperature': 0.6,
                                        'num_predict': 60}}).encode()
+        req = urllib.request.Request(f'{url}/api/generate', body,
+                                     {'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read()).get('response', '').strip()
+
+    def _flavor(self, line: str, lang: str) -> str:
+        lang_name = 'Egyptian Arabic' if lang == 'ar' else 'English'
+        prompt = (f'You are a dramatic mafia-game narrator. Rewrite this line '
+                  f'in {lang_name} only — do not mix in English words or '
+                  f'switch scripts mid-word. Keep it under 25 words, keep '
+                  f'all names exactly as written, no explanations:\n{line}')
+        timeout = float(self.get_parameter('ollama_timeout_s').value)
         try:
-            req = urllib.request.Request(f'{url}/api/generate', body,
-                                         {'Content-Type': 'application/json'})
-            with urllib.request.urlopen(req, timeout=6) as r:
-                text = json.loads(r.read()).get('response', '').strip()
-            return text or line
+            text = self._ollama_generate(prompt, timeout=timeout)
         except Exception as e:  # noqa: BLE001 — any LLM failure -> template
             self.get_logger().warning(
                 f'llm flavor failed ({e}); using template',
                 throttle_duration_sec=30)
             return line
+        if not text or _looks_broken(text):
+            self.get_logger().warning(
+                f'llm flavor output looked broken ({text!r}); using template',
+                throttle_duration_sec=30)
+            return line
+        return text
 
     # ---------- speech ----------
 
