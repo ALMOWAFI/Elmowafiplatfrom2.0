@@ -10,6 +10,7 @@ Phones connect to  http://<server>:8080/
 
 import asyncio
 import json
+import os
 import threading
 from pathlib import Path
 
@@ -25,6 +26,11 @@ from elmowafi_msgs.msg import GameEvent, GameState
 from elmowafi_msgs.srv import SubmitAction
 
 STATIC_DIR = Path(__file__).resolve().parent / 'static'
+# Built React app (vite build output). If present it is served as the UI,
+# with SPA fallback; the plain static page stays available at /simple.
+DIST_DIR = Path(os.environ.get(
+    'ELMOWAFI_WEB_DIST',
+    Path.home() / 'elmowafi_ws/src/elmowafiplatform/web/dist'))
 
 
 class BridgeNode(Node):
@@ -137,6 +143,12 @@ class Bridge:
 
         @app.get('/')
         async def index():
+            if (DIST_DIR / 'index.html').exists():
+                return FileResponse(DIST_DIR / 'index.html')
+            return FileResponse(STATIC_DIR / 'index.html')
+
+        @app.get('/simple')
+        async def simple():
             return FileResponse(STATIC_DIR / 'index.html')
 
         @app.get('/health')
@@ -181,6 +193,18 @@ class Bridge:
             except WebSocketDisconnect:
                 if self.sockets.get(player_id) is ws:
                     self.sockets.pop(player_id, None)
+
+        if DIST_DIR.is_dir():
+            from fastapi.staticfiles import StaticFiles
+            app.mount('/assets', StaticFiles(directory=DIST_DIR / 'assets'),
+                      name='assets')
+
+            @app.get('/{spa_path:path}')
+            async def spa_fallback(spa_path: str):
+                candidate = DIST_DIR / spa_path
+                if candidate.is_file():
+                    return FileResponse(candidate)
+                return FileResponse(DIST_DIR / 'index.html')
 
         return app
 
